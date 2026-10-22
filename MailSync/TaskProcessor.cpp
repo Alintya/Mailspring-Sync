@@ -215,6 +215,37 @@ static vector<uint32_t> _resolveNewUIDs(IMAPSession * session, HashMap * uidmap,
     return result;
 }
 
+// Removes the source copies of a COPY-based move. A plain EXPUNGE would also purge every
+// message another client only marked \Deleted (Outlook desktop's "mark for deletion" mode),
+// so with UIDPLUS it expunges exactly these UIDs (RFC 4315 2.1), as Thunderbird does; the
+// plain EXPUNGE is the fallback when UIDPLUS is absent or the server refuses UID EXPUNGE.
+// After a dropped connection the UID EXPUNGE may already have run, so the copies are left
+// flagged \Deleted rather than risking a plain EXPUNGE on the reconnected session.
+static void _expungeMovedCopies(IMAPSession * session, String * path, IndexSet * uids) {
+    ErrorCode err = ErrorCode::ErrorNone;
+    session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
+    if (err != ErrorCode::ErrorNone) {
+        spdlog::get("logger")->warn("-X Could not flag moved copies \\Deleted in {}, leaving them (error: {})", path->UTF8Characters(), ErrorCodeToTypeMap[err]);
+        return;
+    }
+    if (session->storedCapabilities()->containsIndex(IMAPCapabilityUIDPlus)) {
+        session->expungeUIDs(path, uids, &err);
+        if (err == ErrorCode::ErrorNone) {
+            return;
+        }
+        spdlog::get("logger")->warn("-X UID EXPUNGE failed in {} (error: {})", path->UTF8Characters(), ErrorCodeToTypeMap[err]);
+        if (err != ErrorCode::ErrorExpunge) {
+            return;
+        }
+        err = ErrorCode::ErrorNone;
+    }
+    spdlog::get("logger")->info("-- Expunging all \\Deleted messages in {}", path->UTF8Characters());
+    session->expunge(path, &err);
+    if (err != ErrorCode::ErrorNone) {
+        throw SyncException(err, "moveMessages(copy cleanup)");
+    }
+}
+
 // Moves the items' copies out of `path` into `dest` with UID MOVE, or COPY + \Deleted +
 // EXPUNGE when the server lacks MOVE, and records each copy's new UID on the item. A copy
 // whose new UID cannot be determined is logged and left as it was: its row keeps the
@@ -236,11 +267,7 @@ static void _moveMessagesResilient(IMAPSession * session, String * path, Folder 
         if (err != ErrorCode::ErrorNone) {
             throw SyncException(err, "moveMessages(copy)");
         }
-        session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
-        session->expunge(path, &err); // this will empty their whole trash...
-        if (err != ErrorCode::ErrorNone) {
-            throw SyncException(err, "moveMessages(copy cleanup)");
-        }
+        _expungeMovedCopies(session, path, uids);
         mustApplyAttributes = true;
     }
 
@@ -276,15 +303,17 @@ static void _moveMessagesResilient(IMAPSession * session, String * path, Folder 
 
 // A helper function to permanently remove messages by UID from a given folder path. When a trash folder
 // and CapabilityMove are present, it moves there and expunges. Otherwises it expunges in place.
+// Returns whether the messages have left `path`.
 
-void _removeMessagesResilient(IMAPSession * session, MailStore * store, string accountId, String * path, IndexSet * uids) {
+bool _removeMessagesResilient(IMAPSession * session, MailStore * store, string accountId, String * path, IndexSet * uids) {
     ErrorCode err = ErrorCode::ErrorNone;
+    bool movedToTrash = false;
 
     // First, add the "DELETED" flag to the given messages
     session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
     if (err != ErrorNone) {
         spdlog::get("logger")->info("X- removeMessages could not add deleted flag (error: {})", ErrorCodeToTypeMap[err]);
-        return;
+        return false;
     }
     
     // If possible, move the messages to the identified trash folder.
@@ -303,6 +332,7 @@ void _removeMessagesResilient(IMAPSession * session, MailStore * store, string a
         } else {
             // If we were successful moving to the trash, we will now expunge from here, and the UIDs
             // we had before are no longer valid so we'll need to expunge the entire folder.
+            movedToTrash = true;
             uids->removeAllIndexes();
             path = trashPath;
             
@@ -341,6 +371,7 @@ void _removeMessagesResilient(IMAPSession * session, MailStore * store, string a
     if (err != ErrorNone) {
         spdlog::get("logger")->info("X- removeMessages Expunge failed (error: {})", ErrorCodeToTypeMap[err]);
     }
+    return movedToTrash || err == ErrorNone;
 }
 
 // Deletes the message's server copies, grouped by folder. Used for drafts, whose
@@ -1571,7 +1602,6 @@ void TaskProcessor::performLocalChangeContactGroupMembership(Task * task) {
     for (json & c : task->data()["contacts"]) {
         contactIds.push_back(c["id"].get<string>());
     }
-    auto contacts = store->findLargeSet<Contact>("id", contactIds);
     auto direction = task->data()["direction"].get<string>();
     auto groupId = task->data()["group"]["id"].get<string>();
     
@@ -1589,6 +1619,8 @@ void TaskProcessor::performLocalChangeContactGroupMembership(Task * task) {
         group->syncMembers(store, groupMemberIds);
 
     } else {
+        // Note: loaded here, not above: findLargeSet empties contactIds, which the gmail branch reads.
+        auto contacts = store->findLargeSet<Contact>("id", contactIds);
         auto contactForGroup = store->find<Contact>(Query().equal("id", groupId).equal("accountId", account->id()));
        
         contactForGroup->mutateCardInInfo([&](shared_ptr<VCard> card) {
@@ -1718,8 +1750,6 @@ void TaskProcessor::performLocalSyncbackEvent(Task * task) {
         store->save(existing.get());
         task->data()["event"]["id"] = existing->id();
     } else {
-        // CREATE: Generate new event with temporary ID
-        string tempId = MailUtils::idRandomlyGenerated();
         string icsData = eventJSON["ics"].get<string>();
         ICalendar cal(icsData);
 
@@ -1727,14 +1757,63 @@ void TaskProcessor::performLocalSyncbackEvent(Task * task) {
             throw SyncException("invalid-ics", "ICS data does not contain any events", false);
         }
 
-        // For new event creation, use the first VEVENT (typically only one)
-        // The Event constructor now handles recurrenceId from the ICalendarEvent
-        auto icsEvent = cal.Events.front();
-        Event event("", account->id(), calendarId, icsData, icsEvent);
-        event._data["id"] = tempId;  // Temporary ID until server assigns etag
-        store->save(&event);
+        // The series master is the event's identity; the file may also carry RECURRENCE-ID
+        // overrides, in any order.
+        ICalendarEvent * icsEvent = cal.Events.front();
+        for (auto & vevent : cal.Events) {
+            if (vevent->RecurrenceId.empty()) {
+                icsEvent = vevent;
+                break;
+            }
+        }
+        // The UID names the resource and the row. icalendarlib substitutes a one-byte counter
+        // ("\0", "\1", ...) for a missing or empty one.
+        const string & uid = icsEvent->UID;
+        if (uid.empty() || (uid.size() == 1 && (unsigned char)uid[0] < 0x20)) {
+            throw SyncException("invalid-ics", "VEVENT has no UID", false);
+        }
 
-        task->data()["event"]["id"] = tempId;
+        // Answering a synced invitation creates an event the calendar already holds. Match on UID
+        // and RECURRENCE-ID as runForCalendar() does, or the server answers 409 no-uid-conflict.
+        auto existing = store->find<Event>(Query()
+                                               .equal("calendarId", calendarId)
+                                               .equal("icsuid", icsEvent->UID)
+                                               .equal("recurrenceId", icsEvent->RecurrenceId));
+        if (!existing) {
+            // The Event constructor derives the id from account, calendar, UID and
+            // RECURRENCE-ID; a row can already hold that id if its UID columns were rewritten
+            // by an earlier update. Saving over it is right; inserting would violate the
+            // primary key and abort the process.
+            Event derived("", account->id(), calendarId, icsData, icsEvent);
+            existing = store->find<Event>(Query().equal("id", derived.id()));
+        }
+
+        if (existing) {
+            // Each row stores the whole resource. A file with fewer VEVENTs for this UID than
+            // the stored one would, once PUT, erase the server's exceptions to the series.
+            size_t stored = 0, incoming = 0;
+            ICalendar storedResource(existing->icsData());
+            for (auto & vevent : storedResource.Events) {
+                if (vevent->UID == icsEvent->UID) stored++;
+            }
+            for (auto & vevent : cal.Events) {
+                if (vevent->UID == icsEvent->UID) incoming++;
+            }
+            if (incoming < stored) {
+                throw SyncException("ics-incomplete",
+                                    "The calendar already holds this series with exceptions; "
+                                    "send the whole resource",
+                                    false);
+            }
+            existing->applyICSEventData(existing->etag(), existing->href(), icsData, icsEvent);
+            store->save(existing.get());
+            task->data()["event"]["id"] = existing->id();
+        } else {
+            Event event("", account->id(), calendarId, icsData, icsEvent);
+            store->save(&event);
+            // Hand the id back: the client composed the event without knowing it.
+            task->data()["event"]["id"] = event.id();
+        }
     }
 
     store->save(task);
@@ -1753,14 +1832,8 @@ void TaskProcessor::performRemoteSyncbackEvent(Task * task) {
 }
 
 void TaskProcessor::performLocalDestroyEvent(Task * task) {
-    vector<string> eventIds {};
-    for (json & e : task->data()["events"]) {
-        eventIds.push_back(e["id"].get<string>());
-    }
-
-    // Mark events as hidden locally (they'll be fully removed after remote delete succeeds)
-    // Note: Unlike contacts, we don't have a "hidden" field on events, so we just
-    // leave them in place until performRemote completes.
+    // Rows go in performRemote once the server accepts: a refused DELETE leaves the ctag
+    // unchanged, so no later sync would restore rows removed here.
 }
 
 void TaskProcessor::performRemoteDestroyEvent(Task * task) {
@@ -1769,11 +1842,41 @@ void TaskProcessor::performRemoteDestroyEvent(Task * task) {
         eventIds.push_back(e["id"].get<string>());
     }
 
-    auto events = store->findLargeSet<Event>("id", eventIds);
-    auto dav = make_shared<DAVWorker>(account);
+    // findLargeSet empties eventIds (MailUtils::chunksOfVector erases from it).
+    const size_t requested = eventIds.size();
 
+    auto events = store->findLargeSet<Event>("id", eventIds);
+    if (events.size() != requested) {
+        logger->warn("Destroying {} of {} requested events; the rest are no longer present",
+                     events.size(), requested);
+    }
+
+    auto dav = make_shared<DAVWorker>(account);
+    // One failure must not strand the rest: this loop is the only thing that removes these rows.
+    vector<SyncException> failures {};
     for (auto & event : events) {
-        dav->deleteEvent(event);
+        try {
+            dav->deleteEvent(event);
+        } catch (SyncException & ex) {
+            bool gone = ex.key.find("404") != string::npos || ex.key.find("410") != string::npos;
+            // Gone from the server's own href is what was asked; from a guessed one, maybe not.
+            if (gone && !event->href().empty()) {
+                logger->info("Event {} was already gone from the server; removing locally", event->id());
+                store->remove(event.get());
+                continue;
+            }
+            logger->error("Could not delete event {}: {}", event->id(), ex.toJSON().dump());
+            failures.push_back(ex);
+        }
+    }
+    if (failures.size() == 1) {
+        throw failures.front(); // the reason itself, not a count, when there is only one
+    }
+    if (!failures.empty()) {
+        throw SyncException("delete-failed",
+                            "Could not delete " + to_string(failures.size()) + " of " +
+                                to_string(events.size()) + " events; first: " + failures.front().key,
+                            false);
     }
 }
 
@@ -1901,6 +2004,83 @@ void TaskProcessor::performRemoteDestroyCategory(Task * task) {
     }
     
     logger->info("Deletion of folder/label '{}' succeeded.", path);
+}
+
+// Deletes copies from Sent on the server and drops their placements, so they leave the
+// client now rather than on the folder's next deep scan. A copy the server kept keeps its
+// placement: on a CONDSTORE server nothing would report it again until the 24h gap scan.
+static void _removeSentCopies(IMAPSession * session, MailStore * store, shared_ptr<Account> account, Folder & sent, IndexSet * uids) {
+    vector<uint32_t> removed;
+    for (unsigned int ii = 0; ii < uids->rangesCount(); ii++) {
+        for (uint64_t uid = RangeLeftBound(uids->allRanges()[ii]); uid <= RangeRightBound(uids->allRanges()[ii]); uid++) {
+            removed.push_back((uint32_t)uid);
+        }
+    }
+    if (_removeMessagesResilient(session, store, account->id(), AS_MCSTR(sent.path()), uids)) {
+        MailProcessor{account, store}.deleteVanishedPlacements(sent, removed);
+    }
+}
+
+/*
+ A sent message we appended to Sent because the server's own copy had not appeared yet may
+ get that copy minutes later: Exchange Online made one visible over IMAP ~3 min after the
+ send (2026-09-27), and each recipient of a multisend adds one carrying that recipient's
+ tracking pixel. Both arrive as more placements of the same message. Within
+ SENT_COPY_CLEANUP_WINDOW of the send, while the copy we appended is still there, every
+ other copy of the message in Sent is removed from the server and the store.
+ */
+void TaskProcessor::removeLateSentCopies(Folder & sent) {
+    AutoreleasePool pool;
+    vector<string> messageIds;
+    {
+        // Runs every pass: start from the messages dated within the window (their Date is
+        // the send time) so the account's date index keeps this off the rest of Sent.
+        SQLite::Statement query(store->db(),
+            "SELECT mf.messageId FROM Message m JOIN MessageFolder mf ON mf.messageId = m.id "
+            "WHERE m.accountId = ? AND m.date >= ? AND mf.folderId = ? AND mf.remoteUID > 0 "
+            "GROUP BY mf.messageId HAVING COUNT(*) > 1");
+        query.bind(1, account->id());
+        query.bind(2, (long long)(time(0) - SENT_COPY_CLEANUP_WINDOW));
+        query.bind(3, sent.id());
+        while (query.executeStep()) {
+            messageIds.push_back(query.getColumn("messageId").getString());
+        }
+    }
+
+    for (auto & messageId : messageIds) {
+        auto msg = store->find<Message>(Query().equal("id", messageId));
+        if (msg == nullptr || !msg->_data.count("_asc")) {
+            continue;
+        }
+        json & asc = msg->_data["_asc"];
+        if (asc["f"].get<string>() != sent.id() || asc["x"].get<time_t>() < time(0)) {
+            continue;
+        }
+        uint32_t keepUID = asc["u"].get<uint32_t>();
+        IndexSet * late = IndexSet::indexSet();
+        bool keptPresent = false;
+        for (auto & p : store->placementsForMessage(messageId)) {
+            if (p.folderId != sent.id() || p.remoteUID == 0) {
+                continue;
+            }
+            if (p.remoteUID == keepUID) {
+                keptPresent = true;
+            } else {
+                late->addIndex(p.remoteUID);
+            }
+        }
+        if (!keptPresent || late->count() == 0) {
+            continue;
+        }
+
+        if (!sent.localStatus().count(LS_SERVER_SAVES_SENT)) {
+            json initialLocalStatus = sent.localStatus();
+            sent.localStatus()[LS_SERVER_SAVES_SENT] = true;
+            store->saveFolderStatus(&sent, initialLocalStatus);
+        }
+        logger->info("- Removing {} late server copies of sent message {} from {}, keeping UID {}", late->count(), messageId, sent.path(), keepUID);
+        _removeSentCopies(session, store, account, sent, late);
+    }
 }
 
 void TaskProcessor::performRemoteSendDraft(Task * task) {
@@ -2103,27 +2283,40 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
      folder, others don't.
      */
     uint32_t sentFolderMessageUID = 0;
+    bool appendedToSent = false;
     {
-        // grab the last few items in the sent folder... we know we don't need more than 10
-        // because multisend is capped.
-        int tries = 0;
-        int delay[] = {0, 1, 1, 2, 2};
+        // Exchange Online files its copy 0.5-3.5 s after the SMTP 250, sometimes 6-8 s, and
+        // was seen to take ~3 min (76 sends, 2026-09-27); Gmail, Yahoo and Zoho file one too,
+        // iCloud and Fastmail by default do not. A Sent folder where a copy has turned up
+        // before is given longer, so providers that never file one don't slow every send.
+        // A multisend is one SMTP submission per recipient, and the server files one copy each.
+        bool serverSaves = sent->localStatus().count(LS_SERVER_SAVES_SENT) > 0;
+        vector<int> delays = serverSaves ? vector<int>{0, 1, 1, 2, 2, 3, 3} : vector<int>{0, 1, 1, 2};
+        size_t expected = multisend ? perRecipientBodies.size() - 1 : 1;
         IndexSet * uids = IndexSet::indexSet();
-        
-        while (tries < 4 && uids->count() == 0) {
-            if (delay[tries]) {
-                logger->info("-- No messages found. Sleeping {} to wait for sent folder to settle...", delay[tries]);
-				std::this_thread::sleep_for(std::chrono::seconds(delay[tries]));
+        for (int delay : delays) {
+            if (delay) {
+                logger->info("-- Found {} of {} copies. Sleeping {} to wait for sent folder to settle...", uids->count(), expected, delay);
+                std::this_thread::sleep_for(std::chrono::seconds(delay));
             }
-            tries ++;
+            uids->removeAllIndexes();
             session->findUIDsOfRecentHeaderMessageID(sentPath, AS_MCSTR(draft.headerMessageId()), uids);
+            if (uids->count() >= expected) {
+                break;
+            }
         }
-    
+
+        if (uids->count() > 0 && !serverSaves) {
+            json initialLocalStatus = sent->localStatus();
+            sent->localStatus()[LS_SERVER_SAVES_SENT] = true;
+            store->saveFolderStatus(sent.get(), initialLocalStatus);
+        }
+
         if (multisend && (uids->count() > 0)) {
             // If we sent separate messages to each recipient, we end up with a bunch of sent
             // messages. Delete all of them since they contain the targeted bodies with link/open tracking.
             logger->info("-- Deleting {} messages added to {} by the SMTP gateway.", uids->count(), sentPath->UTF8Characters());
-            _removeMessagesResilient(session, store, account->id(), sentPath, uids);
+            _removeSentCopies(session, store, account, *sent, uids);
             
             // In Gmail, moving the messages from Sent -> Trash and expunging them just places them in All Mail
             // for some reason. Deleting them AGAIN from All Mail works properly, so we do that here.
@@ -2137,13 +2330,12 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
                 }
             }
 
-        } else if (!multisend && (uids->count() == 1)) {
-            // If we find a single message in the sent folder, we'll move forward with that one.
+        } else if (!multisend && (uids->count() > 0)) {
             sentFolderMessageUID = (uint32_t)uids->allRanges()[0].location;
-            logger->info("-- Found a message added to the sent folder by the SMTP gateway (UID {})", sentFolderMessageUID);
+            logger->info("-- Found a message added to the sent folder by the SMTP gateway (UID {}, {} copies)", sentFolderMessageUID, uids->count());
             
         } else {
-            logger->info("-- No messages matching the message-id were found in the Sent folder.", uids->count());
+            logger->info("-- No messages matching the message-id were found in the Sent folder.");
         }
         
         if (err != ErrorNone) {
@@ -2160,6 +2352,8 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         if (err != ErrorNone) {
             logger->error("-X IMAP Error: {}. Could not place a message into the Sent folder. This means no metadata will be attached!", ErrorCodeToTypeMap[err]);
             err = ErrorNone;
+        } else {
+            appendedToSent = true;
         }
 
         // If the user is on Gmail and the thread had labels, apply those same
@@ -2274,6 +2468,19 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
     }
 
     processor.retrievedMessageBody(localMessage.get(), messageParser);
+
+    // A copy the server files after we gave up waiting for it is removed by a later scan of
+    // Sent (removeLateSentCopies), which keeps the one we appended. `_asc` is that copy.
+    if (appendedToSent && placementFolder->id() == sent->id()) {
+        MailStoreTransaction transaction{store, "performRemoteSendDraft"};
+        auto fresh = store->find<Message>(Query().equal("id", localMessage->id()));
+        if (fresh != nullptr) {
+            fresh->_data["_asc"] = {{"f", sent->id()}, {"u", placementUID}, {"x", time(0) + SENT_COPY_CLEANUP_WINDOW}};
+            store->save(fresh.get());
+            store->unsafeEraseTransactionDeltas();
+            transaction.commit();
+        }
+    }
     
     logger->info("-- Synced sent message ({} UID {} = Local ID {})", placementFolder->path(), placementUID, localMessage->id());
     
@@ -2682,6 +2889,26 @@ void TaskProcessor::performRemoteGetManyRFC2822(Task * task) {
         exported, total, failed);
 }
 
+/*
+ The body of a base64 MIME part: 76-character lines, each CRLF-terminated, per RFC 2045
+ section 6.8. mailcore's base64String() (MCEncodeBase64 in
+ Vendor/mailcore2/src/core/basetypes/MCBase64.c) writes no line breaks at all, so a calendar
+ part of a few hundred bytes already exceeds that limit, and past about 740 input bytes the one
+ line also exceeds RFC 5321's 1000-octet line limit, which an MTA may enforce by refusing or
+ truncating the message. A guest list and a description get an invitation there easily.
+ */
+static string base64PartBody(String * text) {
+    string bytes = text->dataUsingEncoding("utf-8")->base64String()->UTF8Characters();
+    const size_t width = 76;
+    string out;
+    out.reserve(bytes.size() + (bytes.size() / width + 1) * 2);
+    for (size_t i = 0; i < bytes.size(); i += width) {
+        out += bytes.substr(i, width);
+        out += "\r\n";
+    }
+    return out;
+}
+
 void TaskProcessor::performRemoteSendRSVP(Task * task) {
     AutoreleasePool pool;
     ErrorCode err = ErrorNone;
@@ -2699,13 +2926,22 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
         ? task->data()["icsRSVPStatus"].get<string>()
         : "ACCEPTED";
 
+    // The iTIP method being sent to the organizer. REPLY answers the invitation; COUNTER
+    // proposes a different time (RFC 5546 section 3.2.7). Absent means REPLY.
+    string method = task->data().count("method")
+        ? task->data()["method"].get<string>()
+        : "REPLY";
+    if (method != "REPLY" && method != "COUNTER") {
+        throw SyncException("invalid-ics", "Unsupported iTIP method: " + method, false);
+    }
+
     // =========================================================================
     // RFC 5546/6047 Validation
     // =========================================================================
 
-    // Validation 1: Check ICS contains METHOD:REPLY (RFC 5546 requirement)
-    if (ics.find("METHOD:REPLY") == string::npos) {
-        throw SyncException("invalid-ics", "ICS data must contain METHOD:REPLY for an RSVP response", false);
+    // Validation 1: the ICS must declare the method we're sending it as (RFC 5546)
+    if (ics.find("METHOD:" + method) == string::npos) {
+        throw SyncException("invalid-ics", "ICS data must contain METHOD:" + method, false);
     }
 
     // Parse the ICS to validate and extract event information
@@ -2720,55 +2956,78 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     // Validation 2: UID is required (RFC 5546 Section 3.2.3 - MUST match original REQUEST)
     if (event->UID.empty()) {
         throw SyncException("invalid-ics",
-            "ICS REPLY must contain UID property matching the original invitation", false);
+            "ICS " + method + " must contain UID property matching the original invitation", false);
     }
 
     // Validation 3: DTSTAMP is required (RFC 5546 Section 3.2.3)
     if (event->DtStamp.IsEmpty()) {
         throw SyncException("invalid-ics",
-            "ICS REPLY must contain DTSTAMP property", false);
+            "ICS " + method + " must contain DTSTAMP property", false);
     }
 
     // Validation 4: ORGANIZER is required (RFC 5546 Section 3.2.3)
     if (event->Organizer.empty()) {
         throw SyncException("invalid-ics",
-            "ICS REPLY must contain ORGANIZER property", false);
+            "ICS " + method + " must contain ORGANIZER property", false);
     }
 
-    // Validation 5: REPLY must contain exactly one ATTENDEE (RFC 5546 Section 3.2.3)
-    if (event->Attendees.size() != 1) {
+    // Validation 5: a REPLY carries exactly one ATTENDEE, the person replying (RFC 5546
+    // Section 3.2.3). A COUNTER carries the proposing attendee and may repeat the rest of
+    // the guest list, so it only needs at least one (Section 3.2.7).
+    if (method == "REPLY" && event->Attendees.size() != 1) {
         throw SyncException("invalid-ics",
             "ICS REPLY must contain exactly one ATTENDEE (the replying user), found " + to_string(event->Attendees.size()), false);
     }
-
-    // Validation 6: Check ATTENDEE has valid PARTSTAT (RFC 5545 Section 3.2.12)
-    bool hasValidPartstat = (ics.find("PARTSTAT=ACCEPTED") != string::npos ||
-                             ics.find("PARTSTAT=DECLINED") != string::npos ||
-                             ics.find("PARTSTAT=TENTATIVE") != string::npos);
-    if (!hasValidPartstat) {
+    if (method == "COUNTER" && event->Attendees.empty()) {
         throw SyncException("invalid-ics",
-            "ATTENDEE must have valid PARTSTAT parameter (ACCEPTED, DECLINED, or TENTATIVE)", false);
+            "ICS COUNTER must contain the ATTENDEE making the proposal", false);
     }
 
-    // Extract attendee email for From address validation
-    // The ICalendar library returns attendee as "Name <email>" or just "email"
-    string attendeeInfo = event->Attendees.front();
-    string attendeeEmail;
-    size_t emailStart = attendeeInfo.find('<');
-    size_t emailEnd = attendeeInfo.find('>');
-    if (emailStart != string::npos && emailEnd != string::npos && emailEnd > emailStart) {
-        attendeeEmail = attendeeInfo.substr(emailStart + 1, emailEnd - emailStart - 1);
-    } else {
-        attendeeEmail = attendeeInfo;
+    // Validation 6: a REPLY states a participation status (RFC 5545 Section 3.2.12); a
+    // COUNTER states a time instead, so it needs DTSTART rather than a PARTSTAT.
+    if (method == "REPLY") {
+        bool hasValidPartstat = (ics.find("PARTSTAT=ACCEPTED") != string::npos ||
+                                 ics.find("PARTSTAT=DECLINED") != string::npos ||
+                                 ics.find("PARTSTAT=TENTATIVE") != string::npos);
+        if (!hasValidPartstat) {
+            throw SyncException("invalid-ics",
+                "ATTENDEE must have valid PARTSTAT parameter (ACCEPTED, DECLINED, or TENTATIVE)", false);
+        }
+    } else if (method == "COUNTER" && event->DtStart.IsEmpty()) {
+        throw SyncException("invalid-ics",
+            "ICS COUNTER must contain the proposed DTSTART", false);
     }
+
+    // The ICalendar library returns attendee as "Name <email>" or just "email"
+    auto emailOf = [](const string & attendeeInfo) {
+        size_t emailStart = attendeeInfo.find('<');
+        size_t emailEnd = attendeeInfo.find('>');
+        if (emailStart != string::npos && emailEnd != string::npos && emailEnd > emailStart) {
+            return attendeeInfo.substr(emailStart + 1, emailEnd - emailStart - 1);
+        }
+        return attendeeInfo;
+    };
+    auto lowercased = [](string value) {
+        transform(value.begin(), value.end(), value.begin(),
+                  [](unsigned char c) { return (char)tolower(c); });
+        return value;
+    };
 
     // Validation 7: Verify From address matches ATTENDEE email (RFC 6047 requirement)
-    // Mismatches may cause the RSVP to be rejected by the organizer's calendar
+    // Mismatches may cause the RSVP to be rejected by the organizer's calendar. A REPLY has
+    // one ATTENDEE, the sender. A COUNTER may carry the whole guest list, so the sender is
+    // whichever entry matches the account; the first entry is only the fallback that makes
+    // the mismatch below visible.
     string fromEmail = account->emailAddress();
-    string lowerFromEmail = fromEmail;
-    string lowerAttendeeEmail = attendeeEmail;
-    transform(lowerFromEmail.begin(), lowerFromEmail.end(), lowerFromEmail.begin(), ::tolower);
-    transform(lowerAttendeeEmail.begin(), lowerAttendeeEmail.end(), lowerAttendeeEmail.begin(), ::tolower);
+    string lowerFromEmail = lowercased(fromEmail);
+    string attendeeEmail = emailOf(event->Attendees.front());
+    for (auto & attendee : event->Attendees) {
+        if (lowercased(emailOf(attendee)) == lowerFromEmail) {
+            attendeeEmail = emailOf(attendee);
+            break;
+        }
+    }
+    string lowerAttendeeEmail = lowercased(attendeeEmail);
 
     if (lowerFromEmail != lowerAttendeeEmail) {
         // Warn but don't fail - email aliases and forwarding may cause legitimate mismatches
@@ -2785,7 +3044,15 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
 
     // Generate human-readable text based on RSVP status (per RFC 6047 recommendation)
     string humanReadableText;
-    if (icsRSVPStatus == "ACCEPTED") {
+    if (method == "COUNTER") {
+        humanReadableText = fromEmail + " proposed a new time for: " + eventSummary;
+        if (task->data().count("comment")) {
+            string comment = task->data()["comment"].get<string>();
+            if (!comment.empty()) {
+                humanReadableText += "\r\n\r\n" + comment;
+            }
+        }
+    } else if (icsRSVPStatus == "ACCEPTED") {
         humanReadableText = fromEmail + " has accepted the invitation to: " + eventSummary;
     } else if (icsRSVPStatus == "DECLINED") {
         humanReadableText = fromEmail + " has declined the invitation to: " + eventSummary;
@@ -2796,11 +3063,7 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     }
 
     // Generate a unique boundary for multipart message
-    string boundary = "----=_Mailspring_RSVP_" + to_string(time(0)) + "_" + to_string(rand());
-
-    // Base64 encode the ICS data (RFC 6047 recommends base64 for maximum compatibility)
-    Data * icsData = AS_MCSTR(ics)->dataUsingEncoding("utf-8");
-    String * icsBase64 = icsData->base64String();
+    string boundary = "----=_Mailspring_" + method + "_" + to_string(time(0)) + "_" + to_string(rand());
 
     // Build MIME headers
     MessageBuilder builder;
@@ -2821,18 +3084,20 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     stringstream mimeBody;
     mimeBody << "--" << boundary << "\r\n";
     mimeBody << "Content-Type: text/plain; charset=UTF-8\r\n";
-    mimeBody << "Content-Transfer-Encoding: 7bit\r\n";
+    // The summary and note are UTF-8; 8-bit bytes under 7bit break RFC 2045 section 6.2 and may
+    // be refused by a relay without 8BITMIME (RFC 6152).
+    mimeBody << "Content-Transfer-Encoding: base64\r\n";
     mimeBody << "\r\n";
-    mimeBody << humanReadableText << "\r\n";
-    mimeBody << "\r\n";
+    mimeBody << base64PartBody(AS_MCSTR(humanReadableText));
     mimeBody << "--" << boundary << "\r\n";
-    // Critical: Content-Type MUST include method=REPLY parameter (RFC 6047 Section 2.4)
-    mimeBody << "Content-Type: text/calendar; method=REPLY; charset=UTF-8\r\n";
+    // Critical: Content-Type MUST include the method parameter (RFC 6047 Section 2.4), and
+    // it MUST agree with the METHOD inside the ICS or receiving calendars discard it.
+    mimeBody << "Content-Type: text/calendar; method=" << method << "; charset=UTF-8\r\n";
     mimeBody << "Content-Transfer-Encoding: base64\r\n";
     // Use inline disposition, not attachment (RFC 6047 Section 2.4)
     mimeBody << "Content-Disposition: inline; filename=\"invite.ics\"\r\n";
     mimeBody << "\r\n";
-    mimeBody << icsBase64->UTF8Characters() << "\r\n";
+    mimeBody << base64PartBody(AS_MCSTR(ics));
     mimeBody << "--" << boundary << "--\r\n";
 
     // Build the complete message by getting headers and appending our body
@@ -2888,7 +3153,8 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     SMTPProgress sprogress;
     MailUtils::configureSessionForAccount(smtp, account);
 
-    logger->info("-- Sending RFC 6047-compliant RSVP ({}) to organizer {}", icsRSVPStatus, organizer);
+    logger->info("-- Sending RFC 6047-compliant {} to organizer {}",
+                 method == "REPLY" ? method + " (" + icsRSVPStatus + ")" : method, organizer);
     smtp.sendMessage(messageData, &sprogress, &err);
 
     if (err != ErrorNone) {
@@ -2898,5 +3164,5 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
         throw SyncException("send-failed", ErrorCodeToTypeMap[err], false);
     }
 
-    logger->info("-- RSVP sent successfully");
+    logger->info("-- {} sent successfully", method);
 }

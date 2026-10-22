@@ -82,7 +82,7 @@ records outcomes for one binary and diffs two recordings (see
 | o365-duplicate-sent-copies | identical copies at adjacent UIDs | fake, dovecot | XPASS since placements; xfail marker to remove |
 | proton-all-mail-duplicates | #137 `\All` skip | fake, dovecot | xfail: busy never clears |
 | gateway-duplicate-list-entries | #139 duplicate LIST lines | fake | pass |
-| netease-id-before-select | #121 ID before SELECT; STATUS without UIDNEXT | fake | skipped unless `/etc/hosts` maps imap.163.com |
+| netease-coremail-id-before-select | #121 ID before SELECT; STATUS without UIDNEXT | fake | pass (Coremail detected by greeting) |
 | uidvalidity-change | UIDVALIDITY remap | fake ×2, dovecot | fake pass; dovecot xfail: segfault |
 | two-folders-identical-messages | #140 non-converging gap scan must settle | fake, dovecot | XPASS since placements; xfail marker to remove |
 | client-task-move | ChangeFolder / Starred / Unread tasks | fake ×2, dovecot | pass |
@@ -114,10 +114,17 @@ records outcomes for one binary and diffs two recordings (see
 | migration-repairs-gmail-label-unread | V11 recounts threads whose label `_u` 0df7864 left as a boolean (1bad091 precedence) | fake (gmail) | pass (fails on eb246b6) |
 | migration-repairs-ghost-folder-refs | V11 recounts a thread listing INBOX with no message there (state written with `db.sql`) | fake | pass (fails on eb246b6) |
 | migration-v11-from-v10-db | 0df7864 -> eb246b6 -> V11 alone: prints "Running Migration", recounts a boolean `_u` and one V10 arithmetic turned into a wrong integer | fake (gmail) | pass (fails on eb246b6) |
+| contacts-from-sent-mail | found-in-mail contact names from old Apple Mail headers (`"<a@b>"`, `")"`, a quoted encoded-word); a later name fills a blank one | fake, dovecot | pass (fails on f7b0239) |
+| migration-v13-repairs-contacts | V13 repairs those names and CardDAV rows written with a grouped EMAIL or an empty FN | fake | pass |
 
 Gaps worth filling next: iCloud / Outlook / NetEase behaviour needs recordings
 (`tools/record_personality.py`) before their quirks can be asserted; `--mode test` and the
-#135 EHLO fallback have no scenario; there is no live-account smoke. (Gmail send / Gmail
+#135 EHLO fallback have no scenario; there is no live-account smoke. There is no CardDAV,
+CalDAV or Google People server kind, so `DAVWorker` and `GoogleContactsWorker` ingest is not
+exercised at all: `migration-v13-repairs-contacts` plants CardDAV rows with `db.sql`, and
+vCard parsing is covered by the `vcard_test` unit target (`test/unit/`). A minimal CardDAV
+fake (PROPFIND discovery, ctag/sync-token, `addressbook-multiget` serving fixed vCards) would
+let a scenario drive `ingestAddressDataNode` and the multiget paths end to end. (Gmail send / Gmail
 label tasks, migration from a pre-placements DB, the 1024-header truncation back-off and
 the modseq-gap truncation are now covered by the scenarios added above.)
 
@@ -206,7 +213,7 @@ Engine interface
   backdates them in the DB (the stopgap until the engine reads intervals from the environment).
 - On Gmail, the engine detects Gmail by the `X-GM-EXT-1` capability, not by `provider`, so
   use `provider: imap` (the default) - `provider: gmail` would try OAuth against Google.
-- Hostname-gated branches (iCloud `imap.mail.me.com`, NetEase `imap.163.com`, Outlook) need
+- Hostname-gated branches (iCloud `imap.mail.me.com`, Outlook) need
   the name to resolve to 127.0.0.1; declare `imap_host` on the server entry and the scenario
   skips with instructions when it does not.
 

@@ -94,6 +94,9 @@ public:
 
     void migrate();
 
+    /** Rebuilds cached event start/end times from stored ICS. See the definition. */
+    void recomputeEventTimes();
+
     SQLite::Database & db();
 
     void resetForAccount(string accountId);
@@ -286,6 +289,7 @@ private:
 
     void _migrateToV10(bool freshDatabase, const string & verb);
     void _migrateToV11(bool announce);
+    void _migrateToV13();
     SQLite::Statement & _placementStatement(const string & key, const string & sql);
     template <typename... Binds>
     int _execPlacement(const string & key, const string & sql, const Binds &... binds);

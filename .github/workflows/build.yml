@@ -5,9 +5,6 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
-  create:
-    tags:
-      - '*'
 
 jobs:
   build:
@@ -29,11 +26,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
+      # Only builds of master are signed, and those are exactly the builds uploaded to S3 below.
       - name: Set up codesigning (MacOS)
-        if: runner.os == 'macOS' # && (github.ref == 'refs/heads/master')
-        uses: apple-actions/import-codesign-certs@v3
+        if: runner.os == 'macOS' && github.ref == 'refs/heads/master'
+        uses: apple-actions/import-codesign-certs@v7
         with:
           p12-file-base64: ${{ secrets.APPLE_CODESIGN_P12 }}
           p12-password: ${{ secrets.APPLE_CODESIGN_KEY_PASSWORD }}
@@ -66,6 +64,8 @@ jobs:
 
       - name: Run build script
         run: ./build.sh
+        env:
+          SIGN_BUILD: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Verify universal binary architectures (macOS)
         if: runner.os == 'macOS'
@@ -111,9 +111,51 @@ jobs:
             echo "✓ mailsync install-check passed on macOS"
           fi
 
+      # A local CA trusted and then denied in the System keychain, like a self-hosted CalDAV
+      # server: HTTPS through libcurl and NetworkRequestUtils' SecTrust check (install-check
+      # sends its request to $IDENTITY_SERVER/ping), and IMAP and SMTP through mailcore's.
+      - name: Certificate checks (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 15
+        run: |
+          set -e
+          export PATH="$(brew --prefix openssl@3)/bin:$PATH"
+          check() { # url expect(accept|reject)
+            out=$(CONFIG_DIR_PATH=/tmp IDENTITY_SERVER="$1" /tmp/mailspring/mailsync --mode install-check 2>/dev/null | grep -o '"http_check":{[^}]*}' || true)
+            if [[ "$out" == *status_code* ]]; then got=accept; else got=reject; fi
+            if [[ "$got" == "$2" ]]; then echo "OK   $1 $out"; else echo "FAIL $1 expected $2: $out"; return 1; fi
+          }
+          e2e() { python3 test/certificates/mailsync_cert_e2e.py --mailsync /tmp/mailspring/mailsync --ca-dir "$ca" "$@"; }
+
+          ca=$(mktemp -d)
+          bash test/certificates/make_local_ca.sh "$ca"
+          python3 -c "
+          import http.server, ssl
+          srv = http.server.HTTPServer(('127.0.0.1', 8443), http.server.SimpleHTTPRequestHandler)
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain('$ca/chain.pem', '$ca/leaf.key')
+          srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+          srv.serve_forever()" &
+          server=$!
+          sleep 2
+
+          check https://127.0.0.1:8443 reject
+          e2e --host 127.0.0.1 --expect reject
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$ca/root.crt"
+          check https://127.0.0.1:8443 accept
+          e2e --host 127.0.0.1 --expect accept
+          e2e --host 127.0.0.1 --expect accept --tls smtp
+          e2e --host localhost --expect reject
+          sudo security add-trusted-cert -d -r deny -k /Library/Keychains/System.keychain "$ca/int.crt"
+          check https://127.0.0.1:8443 reject
+          e2e --host 127.0.0.1 --expect reject
+          # No trust-settings cleanup: remove-trusted-cert waits for interactive authorization,
+          # and the runner is discarded after the job.
+          kill $server
+
       - name: Setup AWS CLI
         if: success() && (github.ref == 'refs/heads/master')
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -130,14 +172,14 @@ jobs:
 
       - name: Upload Linux artifact for distribution testing
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: mailsync.tar.gz
           retention-days: 1
 
       - name: Cache build dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/mailsync-build-deps-v2
           key: ${{ runner.os }}-${{ runner.arch }}-mailsync-deps-${{ hashFiles('**/build.sh') }}
@@ -161,7 +203,7 @@ jobs:
             artifact: mailsync-linux-arm64
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.artifact }}
 
@@ -222,7 +264,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mailsync-linux
 
@@ -300,7 +342,7 @@ jobs:
             arch: arm64
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.artifact }}
 
@@ -385,7 +427,7 @@ jobs:
             artifact: mailsync-linux-arm64
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.artifact }}
 

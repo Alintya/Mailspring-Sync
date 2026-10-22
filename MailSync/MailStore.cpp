@@ -15,9 +15,12 @@
 #include "SyncException.hpp"
 #include "constants.h"
 
+#include "Event.hpp"
+#include "icalendar.h"
 #include "Folder.hpp"
 #include "Message.hpp"
 #include "Thread.hpp"
+#include "DAVUtils.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -89,6 +92,9 @@ MailStore::MailStore() :
     _stmtBeginTransaction(_db, "BEGIN IMMEDIATE TRANSACTION"),
     _stmtRollbackTransaction(_db, "ROLLBACK"),
     _stmtCommitTransaction(_db, "COMMIT"),
+    _transactionOpen(false),
+    // Every DAVWorker's store streams with this; only SyncWorker and main call setStreamDelay.
+    _streamMaxDelay(500),
     _owningThread(spdlog::details::os::thread_id()),
     _labelCacheVersion(0),
     _labelCache(),
@@ -108,9 +114,100 @@ MailStore::MailStore() :
     SQLite::Statement(_db, "PRAGMA main.synchronous = NORMAL").exec();
 }
 
-static int CURRENT_VERSION = 11;
+static int CURRENT_VERSION = 13;
 static string VACUUM_TIME_KEY = "VACUUM_TIME";
 static time_t VACUUM_INTERVAL = 30 * 24 * 60 * 60; // 30 days
+
+/*
+ Rebuilds every event's cached start and end from its stored ICS.
+
+ Those values are written only when an event is fetched, and fetches are gated on ctag and
+ etag, so an event unchanged on the server is never recomputed. A correction to how an ICS
+ timestamp is read would otherwise apply to newly fetched events alone, leaving the table
+ holding two conventions at once and the calendar's range queries selecting across both.
+
+ The indexed recurrenceStart/recurrenceEnd columns are what those queries read, so they are
+ rewritten alongside the data blob; updating the blob by itself would change nothing that is
+ actually queried.
+*/
+void MailStore::recomputeEventTimes() {
+    vector<pair<string, string>> rows;
+    {
+        SQLite::Statement events(_db, "SELECT id, data FROM Event");
+        while (events.executeStep()) {
+            rows.push_back({events.getColumn("id").getString(), events.getColumn("data").getString()});
+        }
+    }
+    if (rows.empty()) {
+        return;
+    }
+
+    cout << "\nRunning Migration";
+    cout.flush();
+
+    // One transaction for the batch: a separate implicit one per row would fsync thousands
+    // of times on a calendar of any size.
+    MailStoreTransaction transaction{this, "recomputeEventTimes"};
+    SQLite::Statement update(
+        _db, "UPDATE Event SET data = ?, recurrenceStart = ?, recurrenceEnd = ? WHERE id = ?");
+
+    int updated = 0;
+    int skipped = 0;
+    for (auto & row : rows) {
+        // Everything for one row, the UPDATE included, is inside the try: a row this cannot
+        // read or write is skipped, because an exception escaping here rolls the batch back,
+        // leaves the schema version where it was, and makes every later launch fail the same way.
+        try {
+            json data = json::parse(row.second);
+            ICalendar cal(data.count("ics") ? data["ics"].get<string>() : "");
+            if (cal.Events.empty()) {
+                skipped++;
+                continue;
+            }
+
+            // One file holds the master and its exceptions; match the VEVENT this row is.
+            // The UID is part of the identity: a resource can hold unrelated events, and two
+            // masters both carry an empty RECURRENCE-ID, so matching on that alone would give
+            // every one of them the first master's times.
+            string rid = data.count("rid") ? data["rid"].get<string>() : "";
+            string uid = data.count("icsuid") ? data["icsuid"].get<string>() : "";
+            ICalendarEvent * match = nullptr;
+            for (auto e : cal.Events) {
+                if (e->RecurrenceId != rid) continue;
+                if (!uid.empty() && !e->UID.empty() && e->UID != uid) continue;
+                match = e;
+                break;
+            }
+            if (!match) match = cal.Events.front();
+            if (match->DtStart.IsEmpty()) {
+                skipped++;
+                continue;
+            }
+
+            int start = match->DtStart.toUnix();
+            int end = endOf(match).toUnix();
+            data["rs"] = start;
+            data["re"] = end;
+
+            update.reset();
+            update.clearBindings();
+            update.bind(1, data.dump());
+            update.bind(2, start);
+            update.bind(3, end);
+            update.bind(4, row.first);
+            update.exec();
+            updated++;
+        } catch (...) {
+            skipped++;
+        }
+    }
+    transaction.commit();
+
+    // The logger is null in migrate mode (see MailStoreTransaction.cpp), so this goes to the
+    // same stream as the "Running Migration" line above.
+    cout << "\nMigration V12: " << updated << " events recomputed, " << skipped << " left as they were";
+    cout.flush();
+}
 
 void MailStore::migrate() {
     SQLite::Statement uv(_db, "PRAGMA user_version");
@@ -163,6 +260,12 @@ void MailStore::migrate() {
     }
     if (version < 11) {
         _migrateToV11(version == 10);
+    }
+    if (version < 12) {
+        recomputeEventTimes();
+    }
+    if (version < 13) {
+        _migrateToV13();
     }
 
     // Update the version flag. Note that we don't want to go from v3 back to v2
@@ -326,6 +429,57 @@ void MailStore::_migrateToV11(bool announce) {
 
     if (recounted) {
         cout << "\nMigration V11: " << recounted << " threads recounted";
+        cout.flush();
+    }
+}
+
+/*
+ V13 rewrites the names and emails contact ingest used to get wrong (see
+ VCard::displayName, VCardProperty::baseName and MailUtils::contactNameFromHeader). CardDAV
+ rows are re-read from their stored vCard, because an unchanged card's etag never triggers
+ a re-fetch; the result is what a fresh sync of the card would store. A row this cannot read
+ is left as it was. Deltas are dropped, as in V11.
+ */
+void MailStore::_migrateToV13() {
+    vector<string> ids;
+    SQLite::Statement find(_db, "SELECT id FROM Contact WHERE source IN (?, ?)");
+    find.bind(1, CONTACT_SOURCE_MAIL);
+    find.bind(2, CARDDAV_SYNC_SOURCE);
+    while (find.executeStep()) {
+        ids.push_back(find.getColumn(0).getString());
+    }
+
+    int repaired = 0;
+    for (auto & chunk : MailUtils::chunksOfVector(ids, 500)) {
+        MailStoreTransaction transaction{this, "_migrateToV13"};
+        for (auto & contact : findAll<Contact>(Query().equal("id", chunk))) {
+            try {
+                string email = contact->email();
+                string name = contact->name();
+                if (contact->source() == CARDDAV_SYNC_SOURCE) {
+                    VCard card(contact->info()["vcf"].get<string>());
+                    email = card.getEmails().front()->getValue();
+                    name = card.displayName();
+                } else {
+                    name = MailUtils::contactNameFromHeader(name, email);
+                }
+                if (email == contact->email() && name == contact->name()) {
+                    continue;
+                }
+                contact->setEmail(email);
+                contact->setName(name);
+                save(contact.get());
+                repaired++;
+            } catch (...) {
+                continue;
+            }
+        }
+        unsafeEraseTransactionDeltas();
+        transaction.commit();
+    }
+
+    if (repaired) {
+        cout << "\nMigration V13: " << repaired << " contacts repaired";
         cout.flush();
     }
 }

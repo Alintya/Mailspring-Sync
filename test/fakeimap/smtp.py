@@ -1,12 +1,13 @@
 """
 A small SMTP server for exercising the engine's send path: EHLO/HELO, AUTH PLAIN/LOGIN,
-MAIL/RCPT/DATA, and optional Postfix-style HELO validation (PR #135). Delivered messages are
+MAIL/RCPT/DATA, optional implicit TLS, and optional Postfix-style HELO validation (PR #135). Delivered messages are
 kept in memory for assertions, and an `inbox` Store mailbox can be given to model a server
 that delivers mail the user sends to themself back into their own INBOX.
 """
 import base64
 import re
 import socketserver
+import ssl
 import threading
 import time
 from typing import Optional
@@ -140,14 +141,19 @@ class _TCP(socketserver.ThreadingTCPServer):
 class FakeSmtpServer:
     def __init__(self, host="127.0.0.1", port=0, credentials=("test", "pass"), hostname="mail.example.test",
                  require_auth=True, reject_non_fqdn_helo=False, deliver_to=None, sent_copy=None,
-                 deliver_delay: float = 0):
+                 deliver_delay: float = 0, sent_copy_delay: float = 0,
+                 tls_context: Optional[ssl.SSLContext] = None):
         """deliver_to: optional (Store, mailbox, address) - messages sent to `address` are appended
         to that mailbox, as a real server delivers self-addressed mail back to the sender.
         sent_copy: optional (Store, mailbox) - every submitted message is also appended there,
         as Gmail's submission service files sent mail under the \\Sent label itself (the
         engine's send path looks for that copy before APPENDing its own).
+        sent_copy_delay: seconds between accepting a message and filing that copy; Exchange
+        Online made it visible 0.5-3.5 s after the 250, twice 6-8 s, once ~3 min (live O365
+        sends, 2026-09-27).
         deliver_delay: seconds between accepting a self-addressed message and delivering it,
-        for a hand-driven client (tools/cyrus_server.py); scenarios use hold()/release()."""
+        for a hand-driven client (tools/cyrus_server.py); scenarios use hold()/release().
+        tls_context: serve implicit TLS (SMTPS, "SSL / TLS" in account settings) with it."""
         self.host, self.port = host, port
         self.credentials = credentials
         self.hostname = hostname
@@ -155,7 +161,9 @@ class FakeSmtpServer:
         self.reject_non_fqdn_helo = reject_non_fqdn_helo
         self.deliver_to = deliver_to
         self.sent_copy = sent_copy
+        self.sent_copy_delay = sent_copy_delay
         self.deliver_delay = deliver_delay
+        self.tls_context = tls_context
         self.messages: list = []
         self.held: Optional[list] = None   # self-addressed deliveries waiting for release()
         self.lock = threading.Lock()
@@ -168,7 +176,10 @@ class FakeSmtpServer:
     def deliver(self, msg: SmtpMessage):
         if self.sent_copy:
             store, mailbox = self.sent_copy
-            store.append(mailbox, msg.raw, ["\\Seen"])
+            if self.sent_copy_delay:
+                threading.Timer(self.sent_copy_delay, store.append, (mailbox, msg.raw, ["\\Seen"])).start()
+            else:
+                store.append(mailbox, msg.raw, ["\\Seen"])
         if not self.deliver_to:
             return
         store, mailbox, address = self.deliver_to
@@ -203,6 +214,14 @@ class FakeSmtpServer:
     def start(self):
         self._server = _TCP((self.host, self.port), _Handler)
         self._server.owner = self
+        if self.tls_context:
+            raw_accept = self._server.get_request
+            tls_context = self.tls_context
+
+            def get_request():
+                sock, addr = raw_accept()
+                return tls_context.wrap_socket(sock, server_side=True), addr
+            self._server.get_request = get_request
         self.port = self._server.server_address[1]
         threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         return self
